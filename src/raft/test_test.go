@@ -40,7 +40,7 @@ func TestInitialElection2A(t *testing.T) {
 	}
 
 	// does the leader+term stay the same if there is no network failure?
-	time.Sleep(2 * RaftElectionTimeout)
+	time.Sleep(6 * RaftElectionTimeout)
 	term2 := cfg.checkTerms()
 	if term1 != term2 {
 		fmt.Printf("warning: term changed even though there were no failures\n")
@@ -97,11 +97,12 @@ func TestBasicAgree2B(t *testing.T) {
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
-		nd, _ := cfg.nCommitted(index)
+		nd, _ := cfg.nCommitted(index) // 多少个server提交了这个日志
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
 
+		// 提交日志
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)

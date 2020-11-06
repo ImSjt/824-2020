@@ -289,6 +289,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// fmt.Printf("sesrver%d append entries, term:%d, leaderid:%d, leadercommit:%d, num: %d\n", rf.me, args.Term, args.LeaderId, args.LeaderCommit, len(args.Entries))
+
 	// 1.如果leader的任期号小于当前任期号，那么就失败，对方并不是leader
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -324,10 +326,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logs = append(rf.logs, args.Entries...)
 
 	// 5.更新提交日志索引
+	lastCommitIndex := rf.commitIndex
 	if args.LeaderCommit < len(rf.logs) {
 		rf.commitIndex = args.LeaderCommit
 	} else {
 		rf.commitIndex = len(rf.logs) - 1
+	}
+
+	// 如果有新的提交日志，那么就将日志应用到状态机
+	if rf.commitIndex != lastCommitIndex {
+		go rf.commitLog(rf.commitIndex)
 	}
 
 	reply.Term = rf.currentTerm
@@ -339,6 +347,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
 	return ok
 }
 
@@ -362,6 +371,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+
+	if rf.state == LEADER {
+		isLeader = true
+		rf.logs = append(rf.logs, LogEntry{
+			Term:    rf.currentTerm,
+			Command: command,
+		})
+		index = len(rf.logs)
+	} else {
+		isLeader = false
+	}
 
 	return index, term, isLeader
 }
@@ -387,6 +411,24 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// 领导者提交日志
+func (rf *Raft) commitLog(commitIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if commitIndex >= len(rf.logs) {
+		commitIndex = len(rf.logs) - 1
+	}
+
+	rf.commitIndex = commitIndex // 在下一个心跳会将日志提交
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i + 1, Command: rf.logs[i].Command}
+	}
+
+	rf.lastApplied = rf.commitIndex
+}
+
 // 向指定跟随者发送附加日志
 func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 	// 向跟随者发送附加日志
@@ -408,7 +450,6 @@ func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 	go func(server int, args AppendEntriesArgs) {
 		var reply AppendEntriesReply
 
-		// fmt.Printf("send append entries to %d\n", server)
 		if ok := rf.sendAppendEntries(server, &args, &reply); ok {
 			rf.handleAppendEntriesReply(server, len(args.Entries), reply)
 		}
@@ -457,13 +498,13 @@ func (rf *Raft) handleAppendEntriesReply(server int, logNum int, reply AppendEnt
 			}
 
 			// 判断是否已经复制
-			if rf.matchIndex[server] >= commitIndex {
+			if rf.matchIndex[i] >= commitIndex {
 				count++
 			}
 
 			// 判断是否已经复制到大多数server
 			if count >= majority(len(rf.peers)) {
-				rf.commitIndex = commitIndex // 在下一个心跳会将日志提交
+				go rf.commitLog(commitIndex)
 				break
 			}
 		}
@@ -503,7 +544,8 @@ func (rf *Raft) handleTimer() {
 	defer rf.mu.Unlock()
 
 	if rf.state == LEADER {
-		// 发送心跳
+		// 发送日志与心跳
+		// fmt.Printf("send heart beat\n")
 		rf.SendAppendEntriesToAllFollwer()
 	} else {
 		// 开始选举
