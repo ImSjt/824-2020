@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -96,8 +97,8 @@ type Raft struct {
 
 // 日志
 type LogEntry struct {
-	command interface{} // 命令
-	term    int         // 该命令leader的任期号
+	Command interface{} // 命令
+	Term    int         // 该命令leader的任期号
 }
 
 // return currentTerm and whether this server
@@ -201,8 +202,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if len(rf.logs) > 0 {
 		lastLogIndex := len(rf.logs) - 1
 		lastLog := rf.logs[lastLogIndex]
-		if lastLog.term > args.LastTermIndex ||
-			(lastLog.term == args.LastTermIndex && lastLogIndex > args.LastLogIndex) {
+		if lastLog.Term > args.LastTermIndex ||
+			(lastLog.Term == args.LastTermIndex && lastLogIndex > args.LastLogIndex) {
 			logUpToData = false
 		}
 	}
@@ -228,6 +229,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = (rf.votedFor == args.CandidateId)
+	}
+
+	if reply.VoteGranted {
+		rf.resetTimer()
 	}
 }
 
@@ -297,7 +302,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.votedFor = -1
 
 	// 2.如果leader的上一条日志与当前不匹配，那么就失败
-	if len(rf.logs) <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].term != args.PrevLogTerm {
+	if args.PrevLogIndex >= 0 {
+		if len(rf.logs) <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			return
+		}
+	} else if args.PrevLogIndex == -1 {
+		// do nothing
+	} else {
+		// error
+		fmt.Printf("error prev log index\n")
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -383,7 +398,7 @@ func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 	}
 
 	if args.PrevLogIndex >= 0 {
-		args.PrevLogTerm = rf.logs[args.PrevLogIndex].term
+		args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 	}
 
 	if rf.nextIndex[server] < len(rf.logs) {
@@ -393,6 +408,7 @@ func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 	go func(server int, args AppendEntriesArgs) {
 		var reply AppendEntriesReply
 
+		// fmt.Printf("send append entries to %d\n", server)
 		if ok := rf.sendAppendEntries(server, &args, &reply); ok {
 			rf.handleAppendEntriesReply(server, len(args.Entries), reply)
 		}
@@ -488,7 +504,7 @@ func (rf *Raft) handleTimer() {
 
 	if rf.state == LEADER {
 		// 发送心跳
-
+		rf.SendAppendEntriesToAllFollwer()
 	} else {
 		// 开始选举
 		rf.state = CANDIDATE  // 成为候选者
@@ -503,7 +519,7 @@ func (rf *Raft) handleTimer() {
 		}
 
 		if len(rf.logs) > 0 {
-			args.LastTermIndex = rf.logs[args.LastLogIndex].term
+			args.LastTermIndex = rf.logs[args.LastLogIndex].Term
 		}
 
 		// 并行向所有server申请投票
@@ -534,7 +550,7 @@ func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 忽略就的任期号
+	// 忽略旧的任期号
 	if reply.Term < rf.currentTerm {
 		return
 	}
@@ -556,14 +572,16 @@ func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
 		if rf.voteGrantedNum >= majority(len(rf.peers)) {
 			rf.state = LEADER
 
+			fmt.Printf("server%d to be leader\n", rf.me)
+
 			// 初始化所有跟随者的日志记录
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
 
-				rf.nextIndex[i] = len(rf.logs) // 日志索引
-				rf.matchIndex[i] = -1          // 已提交的日志索引
+				rf.nextIndex[i] = len(rf.logs)         // 写一个要发送的日志索引
+				rf.matchIndex[i] = rf.nextIndex[i] - 1 // 已复制的日志索引
 			}
 
 			// 重置定时器，开始发送心跳包
