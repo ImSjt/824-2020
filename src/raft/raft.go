@@ -18,12 +18,14 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -121,6 +123,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// 每次修改某些状态的时候，都需要持久化
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
@@ -131,6 +134,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -153,6 +163,12 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
 }
 
 //
@@ -232,6 +248,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if reply.VoteGranted {
+		// 持久化状态
+		rf.persist()
+
 		rf.resetTimer()
 	}
 }
@@ -280,8 +299,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // 跟随者当前的任期号
-	Success bool // true表示跟随者包含PrevLogTerm和PrevLogIndex指示的日志条目
+	MatchIndex int  // 复制日志最后的索引
+	Term       int  // 跟随者当前的任期号
+	Success    bool // true表示跟随者包含PrevLogTerm和PrevLogIndex指示的日志条目
 }
 
 // 跟随者接受日志RPC
@@ -303,7 +323,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.votedFor = -1
 
+	// 接受到心跳，更新跟随者定时器
+	rf.resetTimer()
+
 	// 2.如果leader的上一条日志与当前不匹配，那么就失败
+	// fmt.Printf("prev log index:%d\n", args.PrevLogIndex)
 	if args.PrevLogIndex >= 0 {
 		if len(rf.logs) <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Term = rf.currentTerm
@@ -314,7 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// do nothing
 	} else {
 		// error
-		fmt.Printf("error prev log index\n")
+		fmt.Printf("prev log index error\n")
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -338,11 +362,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.commitLog(rf.commitIndex)
 	}
 
+	reply.MatchIndex = len(rf.logs) - 1
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
-	// 接受到心跳，更新跟随者定时器
-	rf.resetTimer()
+	// 持久化状态
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -383,6 +408,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		})
 		index = len(rf.logs)
+
+		// 持久化
+		rf.persist()
 	} else {
 		isLeader = false
 	}
@@ -404,6 +432,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+
+	// 退出goroutine
 }
 
 func (rf *Raft) killed() bool {
@@ -440,6 +470,7 @@ func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 	}
 
 	if args.PrevLogIndex >= 0 {
+		// fmt.Printf("prev log index:%d, log len:%d\n", args.PrevLogIndex, len(rf.logs))
 		args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 	}
 
@@ -451,7 +482,8 @@ func (rf *Raft) SendAppendEntriesToFollwer(server int) {
 		var reply AppendEntriesReply
 
 		if ok := rf.sendAppendEntries(server, &args, &reply); ok {
-			rf.handleAppendEntriesReply(server, len(args.Entries), reply)
+			heartbeat := (len(args.Entries) == 0)
+			rf.handleAppendEntriesReply(server, heartbeat, reply)
 		}
 	}(server, args)
 }
@@ -467,7 +499,7 @@ func (rf *Raft) SendAppendEntriesToAllFollwer() {
 	}
 }
 
-func (rf *Raft) handleAppendEntriesReply(server int, logNum int, reply AppendEntriesReply) {
+func (rf *Raft) handleAppendEntriesReply(server int, heartbeat bool, reply AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -486,30 +518,44 @@ func (rf *Raft) handleAppendEntriesReply(server int, logNum int, reply AppendEnt
 	}
 
 	if reply.Success {
-		rf.nextIndex[server] += logNum                   // 下一个应该复制的日志索引
-		rf.matchIndex[server] = rf.nextIndex[server] - 1 // 已经复制的日志索引
+		// 如果是心跳包，那么就不判断是否是否需要提交
+		if heartbeat {
+			return
+		}
+
+		rf.nextIndex[server] = reply.MatchIndex + 1 // 下一个应该复制的日志索引
+		rf.matchIndex[server] = reply.MatchIndex    // 已经复制的日志索引
 
 		// 判断该日志是否已经复制到大多数server了，如果是，那么就可以提交
 		commitIndex := rf.matchIndex[server]
 		count := 1
-		for i := 0; i < len(rf.nextIndex); i++ {
-			if i == rf.me {
-				continue
-			}
+		// 只有当前任期的日志才能被提交，根据日志匹配特征，之前的日志也会被提交
+		if rf.logs[commitIndex].Term == rf.currentTerm {
+			for i := 0; i < len(rf.nextIndex); i++ {
+				if i == rf.me {
+					continue
+				}
 
-			// 判断是否已经复制
-			if rf.matchIndex[i] >= commitIndex {
-				count++
-			}
+				// 判断是否已经复制
+				if rf.matchIndex[i] >= commitIndex {
+					count++
+				}
 
-			// 判断是否已经复制到大多数server
-			if count >= majority(len(rf.peers)) {
-				go rf.commitLog(commitIndex)
-				break
+				// 判断是否已经复制到大多数server
+				if count >= majority(len(rf.peers)) {
+					go rf.commitLog(commitIndex)
+					break
+				}
 			}
 		}
 	} else { // 如果发送失败，那么往后移动一个重新发送
-		rf.nextIndex[server] -= 1
+		// fmt.Printf("next index:%d -> -1\n", rf.nextIndex[server])
+		if rf.nextIndex[server] > 0 {
+			rf.nextIndex[server] -= 1
+		} else {
+			panic("next index error\n")
+		}
+
 		rf.SendAppendEntriesToFollwer(server) // 重发
 	}
 }
@@ -539,13 +585,17 @@ func (rf *Raft) resetTimer() {
 	rf.timer.Reset(timeout)
 }
 
+func (rf *Raft) resetTimerQuick() {
+	rf.timer.Reset(0)
+}
+
 func (rf *Raft) handleTimer() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.state == LEADER {
 		// 发送日志与心跳
-		// fmt.Printf("send heart beat\n")
+		// fmt.Printf("server%d send heart beat\n", rf.me)
 		rf.SendAppendEntriesToAllFollwer()
 	} else {
 		// 开始选举
@@ -553,6 +603,9 @@ func (rf *Raft) handleTimer() {
 		rf.currentTerm += 1   // 增加任期号
 		rf.votedFor = rf.me   // 将票投给自己
 		rf.voteGrantedNum = 1 // 获得选票个数
+
+		// 持久化
+		rf.persist()
 
 		args := RequestVoteArgs{
 			Term:         rf.currentTerm,
@@ -564,6 +617,7 @@ func (rf *Raft) handleTimer() {
 			args.LastTermIndex = rf.logs[args.LastLogIndex].Term
 		}
 
+		// fmt.Printf("server%d want to be leader, term:%d\n", rf.me, rf.currentTerm)
 		// 并行向所有server申请投票
 		for server := 0; server < len(rf.peers); server++ {
 			if server == rf.me {
@@ -614,7 +668,7 @@ func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
 		if rf.voteGrantedNum >= majority(len(rf.peers)) {
 			rf.state = LEADER
 
-			fmt.Printf("server%d to be leader\n", rf.me)
+			// fmt.Printf("server%d to be leader, term:%d\n", rf.me, rf.currentTerm)
 
 			// 初始化所有跟随者的日志记录
 			for i := 0; i < len(rf.peers); i++ {
@@ -626,8 +680,9 @@ func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
 				rf.matchIndex[i] = rf.nextIndex[i] - 1 // 已复制的日志索引
 			}
 
-			// 重置定时器，开始发送心跳包
-			rf.resetTimer()
+			// 重置定时器，开始发送心跳包，立即发送心跳
+			// rf.resetTimer()
+			rf.resetTimerQuick()
 		}
 
 		return
@@ -668,9 +723,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
+	// 恢复状态
 	rf.readPersist(persister.ReadRaftState())
 
-	// 启动一个goroutine，处理leader选举
+	// 持久化状态
+	rf.persist()
+
+	// 启动一个goroutine，处理leader选举与日志处理
 	rf.resetTimer()
 
 	return rf

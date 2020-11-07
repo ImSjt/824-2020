@@ -172,7 +172,7 @@ func (cfg *config) start1(i int) {
 	cfg.mu.Unlock()
 
 	// listen to messages from Raft indicating newly committed messages.
-	// 监听raft提交命令
+	// 监听raft提交命令，检查一致性
 	applyCh := make(chan ApplyMsg)
 	go func() {
 		for m := range applyCh {
