@@ -1,15 +1,25 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
+
+const TIMEOUT = time.Second * 3
+
+const (
+	OpGet    = 0
+	OpAppend = 1
+	OpPut    = 2
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,13 +28,25 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  int
+	Key   string
+	Value string
+
+	// 实现命令执行幂等性
+	ClientId int64
+	OpId     int64
 }
 
+type OpWait struct {
+	done chan bool
+	op   Op
+}
+
+// 维护一个状态机
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -35,15 +57,100 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	persister *raft.Persister
+	data      map[string]string
 
+	opWaitQueue   map[int][]OpWait
+	clientOpIndex map[int64]int64
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	var op Op
+
+	op.Type = OpGet
+	op.Key = args.Key
+
+	err := kv.exec(op)
+	if err == OK {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+
+		if value, ok := kv.data[args.Key]; ok {
+			reply.Value = value
+			reply.Err = OK
+		} else {
+			DPrintf("The key(%v) is not exist\n", args.Key)
+			reply.Err = ErrNoKey
+		}
+	} else {
+		DPrintf("Get key failure,err:%v\n", err)
+		reply.Err = err
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	var op Op
+
+	if args.Op == "Put" {
+		op.Type = OpPut
+	} else if args.Op == "Append" {
+		op.Type = OpAppend
+	} else {
+		reply.Err = ErrWrongMethod
+		return
+	}
+
+	op.Key = args.Key
+	op.Value = args.Value
+
+	op.ClientId = args.ClientId
+	op.OpId = args.OpId
+
+	reply.Err = kv.exec(op)
+}
+
+func (kv *KVServer) exec(op Op) Err {
+	opIndex, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		// DPrintf("server%d is not leader\n", kv.me)
+		return ErrWrongLeader
+	}
+
+	// 使用raft写日志，等待提交成功
+	var opWait OpWait
+	opWait.done = make(chan bool)
+	opWait.op = op
+
+	kv.mu.Lock()
+	kv.opWaitQueue[opIndex] = append(kv.opWaitQueue[opIndex], opWait)
+	kv.mu.Unlock()
+
+	ok := false
+	timeout := false
+
+	timer := time.NewTimer(TIMEOUT)
+	select {
+	case ok = <-opWait.done:
+	case <-timer.C:
+		DPrintf("wait operation apply to state machine exceeds timeout....\n")
+		timeout = true
+	}
+
+	kv.mu.Lock()
+	delete(kv.opWaitQueue, opIndex)
+	kv.mu.Unlock()
+
+	if timeout {
+		return ErrTimeOut
+	}
+
+	if !ok {
+		return ErrDup
+	}
+
+	return OK
 }
 
 //
@@ -65,6 +172,46 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+// 命令已在raft中提交
+// 1.应用到状态机
+// 2.通知
+func (kv *KVServer) Apply(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	var op Op
+	op = msg.Command.(Op)
+
+	dup := false
+
+	// 处理重复命令
+	// 如果命令已经被执行过，那么就不执行
+	if op.Type != OpGet && kv.clientOpIndex[op.ClientId] >= op.OpId {
+		DPrintf("Duplicate operation %d %d\n", kv.clientOpIndex[op.ClientId], op.OpId)
+		dup = true
+	} else {
+		switch op.Type {
+		case OpPut:
+			DPrintf("Put Key/Value %v/%v\n", op.Key, op.Value)
+			kv.data[op.Key] = op.Value
+		case OpAppend:
+			DPrintf("Append Key/Value %v/%v\n", op.Key, op.Value)
+			kv.data[op.Key] += op.Value
+		default:
+		}
+		kv.clientOpIndex[op.ClientId] = op.OpId
+	}
+
+	// 通知
+	for _, opWait := range kv.opWaitQueue[msg.CommandIndex] {
+		if dup {
+			opWait.done <- false
+		} else {
+			opWait.done <- true
+		}
+	}
 }
 
 //
@@ -91,11 +238,21 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.persister = persister
+	kv.data = make(map[string]string)
+
+	kv.opWaitQueue = make(map[int][]OpWait)
+	kv.clientOpIndex = make(map[int64]int64)
+
 	// You may need initialization code here.
+	go func() {
+		for msg := range kv.applyCh {
+			kv.Apply(msg)
+		}
+	}()
 
 	return kv
 }

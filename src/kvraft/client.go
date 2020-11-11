@@ -1,13 +1,19 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
 
+	"../labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId int   // leader的地址
+	clientId int64 // 每个客户端都有一个唯一id
+	opId     int64 // 每个操作都需要有一个唯一的id
 }
 
 func nrand() int64 {
@@ -21,6 +27,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leaderId = 0
+	ck.clientId = nrand()
+	ck.opId = 1
+
 	return ck
 }
 
@@ -39,6 +49,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	var args GetArgs
+
+	args.Key = key
+
+	for {
+		var reply GetReply
+
+		if ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply); ok {
+			if reply.Err == OK {
+				return reply.Value
+			} else if reply.Err == ErrWrongLeader {
+				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			} else if reply.Err == ErrTimeOut {
+				DPrintf("Op:Get,Key:%v,Err:%v,retry...\n", key, reply.Err)
+			} else {
+				DPrintf("Op:Get,Key:%v,Err:%v\n", key, reply.Err)
+				break
+			}
+		} else {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		}
+
+	}
+
 	return ""
 }
 
@@ -54,6 +88,35 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	var args PutAppendArgs
+
+	args.Key = key
+	args.Value = value
+	args.Op = op
+
+	args.ClientId = ck.clientId
+	args.OpId = atomic.AddInt64(&ck.opId, 1)
+
+	for {
+		var reply PutAppendReply
+
+		if ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply); ok {
+			if reply.Err == OK {
+				// fmt.Printf("Op:%v,Key:%v,Value:%v,err:%v\n", args.Op, args.Key, args.Value, reply.Err)
+				break
+			} else if reply.Err == ErrWrongLeader {
+				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			} else if reply.Err == ErrTimeOut {
+				DPrintf("Op:%v,Key:%v,Value:%v,err:%v,retry...\n", args.Op, args.Key, args.Value, reply.Err)
+			} else {
+				DPrintf("Op:%v,Key:%v,Value:%v,err:%v\n", args.Op, args.Key, args.Value, reply.Err)
+				break
+			}
+		} else { // 当前leader RPC不可用
+			// fmt.Printf("RPC error...\n")
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

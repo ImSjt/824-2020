@@ -452,6 +452,8 @@ func (rf *Raft) commitLog(commitIndex int) {
 
 	rf.commitIndex = commitIndex // 在下一个心跳会将日志提交
 
+	// commitIndex对应start时候返回的index
+
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i + 1, Command: rf.logs[i].Command}
 	}
@@ -552,8 +554,6 @@ func (rf *Raft) handleAppendEntriesReply(server int, heartbeat bool, reply Appen
 		// fmt.Printf("next index:%d -> -1\n", rf.nextIndex[server])
 		if rf.nextIndex[server] > 0 {
 			rf.nextIndex[server] -= 1
-		} else {
-			panic("next index error\n")
 		}
 
 		rf.SendAppendEntriesToFollwer(server) // 重发
