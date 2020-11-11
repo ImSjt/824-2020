@@ -109,6 +109,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op.OpId = args.OpId
 
 	reply.Err = kv.exec(op)
+
+	// 检查是否为leader
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) exec(op Op) Err {
@@ -136,6 +141,10 @@ func (kv *KVServer) exec(op Op) Err {
 	case <-timer.C:
 		DPrintf("wait operation apply to state machine exceeds timeout....\n")
 		timeout = true
+	}
+
+	if op.Value == "15" {
+		DPrintf("...key/value:%v/%v,opIndex:%v\n", op.Key, op.Value, opIndex)
 	}
 
 	kv.mu.Lock()
@@ -185,6 +194,8 @@ func (kv *KVServer) Apply(msg raft.ApplyMsg) {
 	op = msg.Command.(Op)
 
 	dup := false
+
+	DPrintf("Apply command %v,Key/Value:%v/%v\n", msg.CommandIndex, op.Key, op.Value)
 
 	// 处理重复命令
 	// 如果命令已经被执行过，那么就不执行

@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	"sync/atomic"
 
@@ -102,7 +103,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		if ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply); ok {
 			if reply.Err == OK {
-				// fmt.Printf("Op:%v,Key:%v,Value:%v,err:%v\n", args.Op, args.Key, args.Value, reply.Err)
+				if value == "15" {
+					fmt.Printf("Op:%v,Key:%v,Value:%v,err:%v\n", args.Op, args.Key, args.Value, reply.Err)
+				}
+
 				break
 			} else if reply.Err == ErrWrongLeader {
 				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
@@ -113,7 +117,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				break
 			}
 		} else { // 当前leader RPC不可用
-			// fmt.Printf("RPC error...\n")
+			DPrintf("Op:%v,Key:%v,Value:%v,RPC error\n", args.Op, args.Key, args.Value)
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		}
 	}
