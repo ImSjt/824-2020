@@ -195,8 +195,6 @@ func (kv *KVServer) Apply(msg raft.ApplyMsg) {
 
 	dup := false
 
-	DPrintf("Apply command %v,Key/Value:%v/%v\n", msg.CommandIndex, op.Key, op.Value)
-
 	// 处理重复命令
 	// 如果命令已经被执行过，那么就不执行
 	if op.Type != OpGet && kv.clientOpIndex[op.ClientId] >= op.OpId {
@@ -222,6 +220,11 @@ func (kv *KVServer) Apply(msg raft.ApplyMsg) {
 		} else {
 			opWait.done <- true
 		}
+	}
+
+	// 检查日志是否过大，如果过大，那么就生成快照
+	if kv.persister.RaftStateSize() >= kv.maxraftstate {
+
 	}
 }
 
@@ -257,6 +260,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.opWaitQueue = make(map[int][]OpWait)
 	kv.clientOpIndex = make(map[int64]int64)
+
+	// 读取快照
+	kv.rf.ReadSnapshot(&kv.data)
 
 	// You may need initialization code here.
 	go func() {

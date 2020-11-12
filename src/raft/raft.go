@@ -62,6 +62,8 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	LogIndex     int
+	LogTerm      int
 }
 
 //
@@ -95,6 +97,10 @@ type Raft struct {
 	applyCh        chan ApplyMsg // 监听提交信息
 	timer          *time.Timer   // 定时器，用于leader选举
 	voteGrantedNum int           // 获得选票数
+
+	// 快照
+	lastIncludedIndex int // 状态机最后应用日志的索引
+	lastIncludedTerm  int // 状态机最后应用日志的任期号
 }
 
 // 日志
@@ -455,7 +461,7 @@ func (rf *Raft) commitLog(commitIndex int) {
 	// commitIndex对应start时候返回的index
 
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i + 1, Command: rf.logs[i].Command}
+		rf.applyCh <- ApplyMsg{CommandValid: true, CommandIndex: i + 1, Command: rf.logs[i].Command, LogIndex: i, LogTerm: rf.logs[i].Term}
 	}
 
 	rf.lastApplied = rf.commitIndex
@@ -689,6 +695,66 @@ func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
 	}
 }
 
+func (rf *Raft) makeRaftState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+
+	return data
+}
+
+func (rf *Raft) makeSnapshot(data map[string]string, lastIncludedIndex int, lastIncludedTerm int) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(lastIncludedIndex)
+	e.Encode(lastIncludedTerm)
+	e.Encode(data)
+	snapshot := w.Bytes()
+
+	return snapshot
+}
+
+// 保存快照，在状态机检测到日志过大时调用
+// 快照已完成，接下来就是处理日志索引问题
+func (rf *Raft) SaveSnapshot(data map[string]string, lastIncludedIndex int, lastIncludedTerm int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 1.删除快照最后一条日志之前的日志
+	rf.logs = rf.logs[lastIncludedIndex-rf.lastIncludedIndex:]
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+
+	// 2.生成快照
+	state := rf.makeRaftState()
+	snapshot := rf.makeSnapshot(data, lastIncludedIndex, lastIncludedTerm)
+
+	rf.persister.SaveStateAndSnapshot(state, snapshot)
+}
+
+// 状态机启动时调用
+func (rf *Raft) ReadSnapshot(data *map[string]string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 恢复快照
+	if rf.persister.SnapshotSize() <= 0 {
+		rf.lastIncludedIndex = -1
+		rf.lastIncludedTerm = -1
+		return
+	}
+
+	r := bytes.NewBuffer(rf.persister.ReadSnapshot())
+	d := labgob.NewDecoder(r)
+
+	d.Decode(&rf.lastIncludedIndex)
+	d.Decode(&rf.lastIncludedTerm)
+	d.Decode(data)
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -727,7 +793,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// 持久化状态
-	rf.persist()
+	// rf.persist()
 
 	// 启动一个goroutine，处理leader选举与日志处理
 	rf.resetTimer()
